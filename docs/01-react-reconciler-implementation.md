@@ -155,22 +155,268 @@ getChildHostContext(parentHostContext, type) {
 
 ## 渲染流程详解
 
-### 1. 组件挂载流程
+### 1. 组件挂载流程：从 JSX 到终端输出
+
+让我们通过一个具体例子 `<Text color="green">Hello</Text>` 来详细追踪整个渲染流程。
+
+#### 步骤 1：JSX 转换和组件创建
+
+```jsx
+// 用户代码
+<Text color="green">Hello</Text>
+
+// Babel 转换后
+React.createElement(Text, { color: "green" }, "Hello")
+
+// Text 组件内部实现 (src/components/Text.tsx)
+export default function Text({color, children, ...props}) {
+  const transform = (text: string): string => {
+    if (color) {
+      return colorize(text, color, 'foreground');
+    }
+    return text;
+  };
+  
+  return (
+    <ink-text
+      style={{flexGrow: 0, flexShrink: 1, flexDirection: 'row', textWrap: wrap}}
+      internal_transform={transform}
+    >
+      {children}
+    </ink-text>
+  );
+}
+```
+
+#### 步骤 2：Reconciler 处理组件树
+
+React Reconciler 开始工作，创建 Fiber 节点：
+
+```typescript
+// 1. 处理 Text 组件，返回 ink-text 元素
+// 2. Reconciler 看到 ink-text，调用 createInstance
+
+createInstance(originalType, newProps, rootNode, hostContext) {
+  // originalType = 'ink-text'
+  // newProps = { 
+  //   style: {flexGrow: 0, flexShrink: 1, flexDirection: 'row', textWrap: 'wrap'},
+  //   internal_transform: [Function],
+  //   children: 'Hello'
+  // }
+  // hostContext = { isInsideText: false }
+  
+  const type = originalType === 'ink-text' && hostContext.isInsideText
+    ? 'ink-virtual-text'
+    : originalType; // 结果是 'ink-text'
+  
+  // 创建 DOM 节点
+  const node = createNode(type);
+  // node = {
+  //   nodeName: 'ink-text',
+  //   style: {},
+  //   attributes: {},
+  //   childNodes: [],
+  //   yogaNode: Yoga.Node.create()
+  // }
+  
+  // 处理 props
+  for (const [key, value] of Object.entries(newProps)) {
+    if (key === 'style') {
+      setStyle(node, value);
+      applyStyles(node.yogaNode, value); // 应用 Flexbox 样式
+    }
+    
+    if (key === 'internal_transform') {
+      node.internal_transform = value; // 保存文本转换函数
+    }
+  }
+  
+  return node;
+}
+```
+
+#### 步骤 3：处理文本内容
+
+Reconciler 发现 "Hello" 是文本内容，需要创建文本节点：
+
+```typescript
+// 更新 hostContext
+getChildHostContext(parentHostContext, type) {
+  // type = 'ink-text'
+  const isInsideText = type === 'ink-text' || type === 'ink-virtual-text';
+  // isInsideText = true
+  
+  return { isInsideText: true };
+}
+
+// 创建文本节点
+createTextInstance(text, _root, hostContext) {
+  // text = "Hello"
+  // hostContext = { isInsideText: true }
+  
+  if (!hostContext.isInsideText) {
+    throw new Error(`Text string "${text}" must be rendered inside <Text> component`);
+  }
+  
+  return createTextNode(text);
+  // 返回 { nodeName: '#text', nodeValue: 'Hello' }
+}
+```
+
+#### 步骤 4：构建节点树
+
+```typescript
+// 将文本节点添加到 ink-text 节点
+appendInitialChild(parentInstance, child) {
+  // parentInstance = ink-text 节点
+  // child = 文本节点
+  
+  appendChildNode(parentInstance, child);
+  // ink-text.childNodes = [{ nodeName: '#text', nodeValue: 'Hello' }]
+}
+```
+
+#### 步骤 5：布局计算
+
+当组件树构建完成后，触发布局计算：
+
+```typescript
+// src/ink.tsx - calculateLayout
+calculateLayout = () => {
+  const terminalWidth = this.options.stdout.columns || 80;
+  
+  // 设置根节点宽度
+  this.rootNode.yogaNode!.setWidth(terminalWidth);
+  
+  // Yoga 计算布局
+  this.rootNode.yogaNode!.calculateLayout(
+    undefined,
+    undefined,
+    Yoga.DIRECTION_LTR
+  );
+  
+  // 此时每个节点都有了计算后的位置和尺寸
+  // ink-text 节点: x=0, y=0, width=5, height=1
+};
+```
+
+#### 步骤 6：渲染到 Output
+
+```typescript
+// src/render-node-to-output.ts
+const renderNodeToOutput = (node: DOMElement, output: Output, options) => {
+  const {yogaNode} = node;
+  
+  if (node.nodeName === 'ink-text') {
+    // 获取所有文本内容
+    let text = squashTextNodes(node); // "Hello"
+    
+    // 应用转换（颜色）
+    if (node.internal_transform) {
+      text = node.internal_transform(text);
+      // 结果: "\x1B[32mHello\x1B[39m" (带绿色 ANSI 代码的文本)
+    }
+    
+    // 获取位置
+    const x = yogaNode.getComputedLeft(); // 0
+    const y = yogaNode.getComputedTop();  // 0
+    
+    // 写入到输出缓冲区
+    output.write(x, y, text);
+  }
+};
+```
+
+#### 步骤 7：生成最终输出
+
+```typescript
+// src/output.ts
+class Output {
+  private canvas: string[][] = [];
+  
+  write(x: number, y: number, text: string) {
+    // 将文本写入虚拟画布的指定位置
+    const lines = text.split('\n');
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const row = y + i;
+      
+      if (!this.canvas[row]) {
+        this.canvas[row] = [];
+      }
+      
+      // 逐字符写入（处理 ANSI 序列）
+      let column = x;
+      for (const char of line) {
+        this.canvas[row][column] = char;
+        column++;
+      }
+    }
+  }
+  
+  get() {
+    // 将虚拟画布转换为字符串
+    const lines = this.canvas.map(row => row.join(''));
+    return {
+      output: lines.join('\n'), // "\x1B[32mHello\x1B[39m"
+      height: lines.length       // 1
+    };
+  }
+}
+```
+
+#### 步骤 8：输出到终端
+
+```typescript
+// src/ink.tsx - onRender
+onRender = () => {
+  const {output, outputHeight} = render(this.rootNode);
+  
+  if (output !== this.lastOutput) {
+    // 使用 log-update 更新终端
+    this.throttledLog(output);
+    // 终端显示绿色的 "Hello"
+    
+    this.lastOutput = output;
+    this.lastOutputHeight = outputHeight;
+  }
+};
+```
+
+#### 完整流程图
 
 ```
-React 组件
-    ↓
-Reconciler 创建 Fiber 树
-    ↓
-调用 createInstance 创建 DOM 节点
-    ↓
-构建 Yoga 节点进行布局计算
-    ↓
-调用 appendChild 构建树结构
-    ↓
-commitMount 完成挂载
-    ↓
-触发渲染输出到终端
+<Text color="green">Hello</Text>
+         ↓
+React.createElement(Text, {color: "green"}, "Hello")
+         ↓
+Text 组件返回 <ink-text internal_transform={colorize}>Hello</ink-text>
+         ↓
+Reconciler.createInstance('ink-text', props)
+    - 创建 DOMElement { nodeName: 'ink-text', yogaNode: ... }
+    - 保存 internal_transform 函数
+         ↓
+Reconciler.createTextInstance('Hello')
+    - 创建 TextNode { nodeName: '#text', nodeValue: 'Hello' }
+         ↓
+appendChild(ink-text, textNode)
+    - 构建父子关系
+         ↓
+Yoga 布局计算
+    - 计算位置 (x=0, y=0) 和尺寸 (width=5, height=1)
+         ↓
+renderNodeToOutput()
+    - 提取文本: "Hello"
+    - 应用转换: "\x1B[32mHello\x1B[39m"
+    - 写入 Output 对象的 (0, 0) 位置
+         ↓
+Output.get()
+    - 生成最终字符串: "\x1B[32mHello\x1B[39m"
+         ↓
+log-update(output)
+    - 输出到终端
+    - 用户看到绿色的 "Hello"
 ```
 
 ### 2. 更新流程
