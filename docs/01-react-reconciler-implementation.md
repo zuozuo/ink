@@ -19,6 +19,240 @@ React 的设计允许通过提供不同的 Host Config 来支持不同的渲染�
 - React Native → 原生移动组件
 - **Ink → 终端输出**
 
+### 什么是 Fiber？
+
+Fiber 是 React 16+ 中引入的核心概念，它是 React 内部的工作单元，代表了组件树中的一个节点。理解 Fiber 对于理解 React Reconciler 的工作原理至关重要。
+
+#### Fiber 的核心概念
+
+1. **Fiber 是一个 JavaScript 对象**，包含了组件的信息和工作进度：
+
+```typescript
+interface Fiber {
+  // 组件类型信息
+  type: any;                    // 函数组件、类组件或原生元素类型
+  key: null | string;           // React key
+  elementType: any;             // 元素类型
+  
+  // 组件实例和 props
+  stateNode: any;               // 对应的真实 DOM 节点或组件实例
+  pendingProps: any;            // 新的 props
+  memoizedProps: any;           // 上一次渲染的 props
+  memoizedState: any;           // 上一次渲染的 state
+  
+  // Fiber 树结构
+  return: Fiber | null;         // 父 Fiber
+  child: Fiber | null;          // 第一个子 Fiber
+  sibling: Fiber | null;        // 下一个兄弟 Fiber
+  index: number;                // 在兄弟中的位置
+  
+  // 副作用
+  flags: Flags;                 // 副作用标记（更新、删除、新增等）
+  subtreeFlags: Flags;          // 子树的副作用标记
+  deletions: Fiber[] | null;    // 需要删除的子 Fiber
+  
+  // 调度优先级
+  lanes: Lanes;                 // 优先级
+  childLanes: Lanes;            // 子树的优先级
+  
+  // 双缓冲
+  alternate: Fiber | null;      // 指向另一个版本的 Fiber（current ↔ workInProgress）
+}
+```
+
+2. **Fiber 的双缓冲机制**：React 维护两棵 Fiber 树
+   - **Current Fiber Tree**：当前显示在屏幕上的组件树
+   - **Work-in-Progress Fiber Tree**：正在内存中构建的新树
+
+```typescript
+// 示例：更新时的双缓冲
+function beginWork(current: Fiber | null, workInProgress: Fiber) {
+  // current 是当前屏幕上的 Fiber
+  // workInProgress 是正在构建的新 Fiber
+  
+  if (current !== null) {
+    // 更新现有组件
+    if (current.memoizedProps !== workInProgress.pendingProps) {
+      // props 发生变化，需要更新
+    }
+  } else {
+    // 挂载新组件
+  }
+}
+```
+
+3. **Fiber 如何实现可中断渲染**：
+
+```typescript
+// 传统的递归渲染（不可中断）
+function renderRecursive(element) {
+  if (element.children) {
+    element.children.forEach(child => {
+      renderRecursive(child);  // 递归调用，无法中断
+    });
+  }
+}
+
+// Fiber 的链表遍历（可中断）
+function performUnitOfWork(fiber: Fiber) {
+  // 处理当前 Fiber
+  beginWork(fiber);
+  
+  // 返回下一个要处理的 Fiber
+  if (fiber.child) {
+    return fiber.child;
+  }
+  
+  while (fiber) {
+    completeWork(fiber);
+    
+    if (fiber.sibling) {
+      return fiber.sibling;
+    }
+    
+    fiber = fiber.return;  // 回到父节点
+  }
+  
+  return null;
+}
+
+// 工作循环（可以在任何时候中断）
+function workLoop(deadline) {
+  while (nextUnitOfWork && deadline.timeRemaining() > 0) {
+    nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+  }
+  
+  if (nextUnitOfWork) {
+    // 时间用完了，请求下一次调度
+    requestIdleCallback(workLoop);
+  }
+}
+```
+
+#### Fiber 在 Ink 中的应用
+
+在 Ink 的上下文中，Fiber 工作流程如下：
+
+1. **创建 Fiber 节点**：当 React 处理 `<Text color="green">Hello</Text>` 时
+
+```typescript
+// React 为 Text 组件创建 Fiber
+const textComponentFiber = {
+  type: Text,                           // Text 函数组件
+  pendingProps: { color: "green" },     // 新 props
+  stateNode: null,                      // 函数组件没有实例
+  return: parentFiber,                  // 父 Fiber
+  child: null,                          // 将在 beginWork 中创建
+  flags: NoFlags,                       // 初始无副作用
+};
+
+// 执行 Text 组件，返回 <ink-text>
+const inkTextElement = Text({ color: "green", children: "Hello" });
+
+// 为 ink-text 创建 Fiber
+const inkTextFiber = {
+  type: "ink-text",                     // Host 组件类型
+  pendingProps: {
+    style: { flexGrow: 0, ... },
+    internal_transform: colorizeFunction,
+  },
+  stateNode: null,                      // 将在 createInstance 中创建
+  return: textComponentFiber,           // 父 Fiber
+  flags: Placement,                     // 需要插入 DOM
+};
+```
+
+2. **Fiber 与 Host 实例的关联**：
+
+```typescript
+// 在 createInstance 中创建 DOM 节点并关联到 Fiber
+createInstance(type, props, rootContainer, hostContext) {
+  const domElement = createNode(type);
+  
+  // ... 设置属性
+  
+  // 这个 DOM 元素会被保存到 Fiber.stateNode
+  return domElement;
+}
+
+// 关联后
+inkTextFiber.stateNode = {
+  nodeName: 'ink-text',
+  yogaNode: YogaNode,
+  childNodes: [],
+  internal_transform: colorizeFunction,
+};
+```
+
+3. **Fiber 树的遍历和更新**：
+
+```typescript
+// 当状态更新时，React 会：
+// 1. 克隆 Fiber 节点创建 workInProgress 树
+// 2. 在 workInProgress 树上执行更新
+// 3. 比较新旧 props 决定是否需要更新 Host 实例
+
+function updateHostComponent(current, workInProgress) {
+  const oldProps = current.memoizedProps;
+  const newProps = workInProgress.pendingProps;
+  
+  if (oldProps !== newProps) {
+    // 标记需要更新
+    workInProgress.flags |= Update;
+    
+    // 准备更新数据
+    const updatePayload = prepareUpdate(
+      workInProgress.stateNode,
+      type,
+      oldProps,
+      newProps
+    );
+    
+    workInProgress.updateQueue = updatePayload;
+  }
+}
+```
+
+4. **副作用的收集和执行**：
+
+```typescript
+// Fiber 使用标记来追踪需要执行的操作
+const Placement = 0b000001;      // 插入
+const Update = 0b000010;         // 更新  
+const Deletion = 0b000100;       // 删除
+
+// 在 commit 阶段，根据标记执行实际操作
+function commitWork(fiber) {
+  if (fiber.flags & Placement) {
+    // 调用 appendChild 插入节点
+    appendChildToContainer(fiber.stateNode);
+  }
+  
+  if (fiber.flags & Update) {
+    // 调用 commitUpdate 更新属性
+    commitUpdate(fiber.stateNode, fiber.updateQueue);
+  }
+  
+  if (fiber.flags & Deletion) {
+    // 调用 removeChild 删除节点
+    removeChildFromContainer(fiber.stateNode);
+  }
+}
+```
+
+#### Fiber 的优势
+
+1. **可中断和恢复**：渲染工作可以被分割成小块，允许浏览器处理高优先级任务
+2. **优先级调度**：不同的更新可以有不同的优先级
+3. **双缓冲**：在内存中准备新树，减少 UI 闪烁
+4. **增量渲染**：可以逐步完成渲染，而不是一次性完成
+
+在 Ink 的场景中，虽然终端渲染通常很快，但 Fiber 架构仍然带来了：
+- 统一的 React 开发体验
+- 支持 Suspense、Concurrent Features 等高级特性
+- 更好的错误边界处理
+- 未来的性能优化空间
+
 ## Ink 的 Host Config 实现
 
 ### 1. 节点类型定义
