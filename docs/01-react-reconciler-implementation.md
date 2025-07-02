@@ -786,6 +786,430 @@ const diff = (before: AnyObject, after: AnyObject): AnyObject | undefined => {
 };
 ```
 
+## React Reconciliation 算法中的 Diff 算法深度解析
+
+### Diff 算法的核心原理
+
+React 的 Reconciliation（协调）算法是 React 用来确定如何高效更新 UI 以匹配最新状态的过程。其核心是通过 diff 算法比较两棵虚拟 DOM 树的差异，并将这些差异应用到实际 DOM 上。
+
+#### 传统 Diff 算法的问题
+
+传统的树 diff 算法时间复杂度为 O(n³)，对于大型应用来说性能开销过大。React 通过三个关键假设将复杂度降低到 O(n)：
+
+1. **不同类型的元素会产生不同的树**
+2. **可以通过 key 属性来标识哪些子元素在不同的渲染中保持稳定**
+3. **只对同一层级的节点进行比较**
+
+### Ink 中的 Diff 算法实现
+
+#### 1. 属性 Diff 实现 (reconciler.ts:53-84)
+
+Ink 实现了一个简洁高效的属性 diff 函数：
+
+```typescript
+const diff = (before: AnyObject, after: AnyObject): AnyObject | undefined => {
+    // 快速路径：引用相等检查
+    if (before === after) {
+        return;
+    }
+    
+    // 边界情况：before 不存在
+    if (!before) {
+        return after;
+    }
+    
+    const changed: AnyObject = {};
+    let isChanged = false;
+    
+    // 阶段1：检测被删除的属性
+    for (const key of Object.keys(before)) {
+        const isDeleted = after ? !Object.hasOwn(after, key) : true;
+        
+        if (isDeleted) {
+            changed[key] = undefined;  // undefined 表示删除
+            isChanged = true;
+        }
+    }
+    
+    // 阶段2：检测新增或修改的属性
+    if (after) {
+        for (const key of Object.keys(after)) {
+            if (after[key] !== before[key]) {
+                changed[key] = after[key];
+                isChanged = true;
+            }
+        }
+    }
+    
+    return isChanged ? changed : undefined;
+};
+```
+
+这个 diff 函数的特点：
+- **高效**：使用引用相等检查快速跳过无变化的对象
+- **完整**：同时处理属性的新增、修改和删除
+- **精确**：只返回实际变化的属性，减少后续处理
+
+#### 2. 节点树的 Diff 操作
+
+Ink 通过实现 React Reconciler 的标准接口来处理节点树的变化：
+
+##### 2.1 节点创建 (createInstance)
+当 React 发现需要创建新节点时：
+```typescript
+createInstance(originalType, newProps, rootNode, hostContext) {
+    const node = createNode(type);
+    
+    // 应用所有属性
+    for (const [key, value] of Object.entries(newProps)) {
+        if (key === 'style') {
+            setStyle(node, value as Styles);
+            applyStyles(node.yogaNode, value as Styles);
+        } else if (key === 'internal_transform') {
+            node.internal_transform = value as OutputTransformer;
+        } else {
+            setAttribute(node, key, value as DOMNodeAttribute);
+        }
+    }
+    
+    return node;
+}
+```
+
+##### 2.2 节点更新 (commitUpdate)
+当属性发生变化时：
+```typescript
+commitUpdate(node, _type, oldProps, newProps) {
+    // 使用 diff 函数计算变化
+    const props = diff(oldProps, newProps);
+    const style = diff(
+        oldProps['style'] as Styles,
+        newProps['style'] as Styles,
+    );
+    
+    // 只有存在变化时才更新
+    if (!props && !style) {
+        return;
+    }
+    
+    // 应用属性变化
+    if (props) {
+        for (const [key, value] of Object.entries(props)) {
+            if (key === 'style') {
+                setStyle(node, value as Styles);
+            } else {
+                setAttribute(node, key, value as DOMNodeAttribute);
+            }
+        }
+    }
+    
+    // 应用样式变化
+    if (style && node.yogaNode) {
+        applyStyles(node.yogaNode, style);
+    }
+}
+```
+
+##### 2.3 子节点操作
+Ink 实现了完整的子节点操作接口：
+
+```typescript
+// 添加子节点
+appendChildNode(node: DOMElement, childNode: DOMElement): void {
+    if (childNode.parentNode) {
+        removeChildNode(childNode.parentNode, childNode);
+    }
+    
+    childNode.parentNode = node;
+    node.childNodes.push(childNode);
+    
+    // 同步 Yoga 布局树
+    if (childNode.yogaNode) {
+        node.yogaNode?.insertChild(
+            childNode.yogaNode,
+            node.yogaNode.getChildCount(),
+        );
+    }
+}
+
+// 插入子节点
+insertBeforeNode(
+    node: DOMElement,
+    newChildNode: DOMNode,
+    beforeChildNode: DOMNode,
+): void {
+    const index = node.childNodes.indexOf(beforeChildNode);
+    if (index >= 0) {
+        node.childNodes.splice(index, 0, newChildNode);
+        if (newChildNode.yogaNode) {
+            node.yogaNode?.insertChild(newChildNode.yogaNode, index);
+        }
+    }
+}
+
+// 移除子节点
+removeChildNode(node: DOMElement, removeNode: DOMNode): void {
+    if (removeNode.yogaNode) {
+        removeNode.parentNode?.yogaNode?.removeChild(removeNode.yogaNode);
+    }
+    
+    removeNode.parentNode = undefined;
+    
+    const index = node.childNodes.indexOf(removeNode);
+    if (index >= 0) {
+        node.childNodes.splice(index, 1);
+    }
+}
+```
+
+#### 3. Key 的处理和列表 Diff
+
+从测试用例可以看到 Ink 对 key 的支持：
+
+```typescript
+// 测试：使用 key 重排序子元素 (reconciler.tsx:248-304)
+function Test({reorder}: {readonly reorder?: boolean}) {
+    if (reorder) {
+        return (
+            <Box flexDirection="column">
+                <Text key="b">B</Text>
+                <Text key="a">A</Text>
+            </Box>
+        );
+    }
+    
+    return (
+        <Box flexDirection="column">
+            <Text key="a">A</Text>
+            <Text key="b">B</Text>
+        </Box>
+    );
+}
+```
+
+当组件从第一种状态更新到第二种状态时：
+1. React 通过 key 识别出两个 Text 组件是相同的，只是位置变了
+2. 不会销毁和重建组件，而是调用 `insertBeforeNode` 重新排序
+3. 保留了组件的内部状态和 DOM 节点
+
+### React Reconciliation 的完整工作流程
+
+#### 1. 更新触发
+- 组件调用 `setState` 或接收新的 props
+- React 将更新任务加入更新队列
+- 调度器决定何时开始处理更新
+
+#### 2. Render 阶段（可中断）
+
+##### 2.1 构建 Work-in-Progress 树
+```typescript
+function beginWork(current: Fiber | null, workInProgress: Fiber) {
+    if (current !== null) {
+        // 更新现有组件
+        const oldProps = current.memoizedProps;
+        const newProps = workInProgress.pendingProps;
+        
+        if (oldProps !== newProps || hasLegacyContextChanged()) {
+            // 需要更新
+            didReceiveUpdate = true;
+        } else {
+            // 可以复用
+            return bailoutOnAlreadyFinishedWork(current, workInProgress);
+        }
+    }
+    
+    // 根据组件类型处理
+    switch (workInProgress.tag) {
+        case FunctionComponent:
+            return updateFunctionComponent(current, workInProgress);
+        case ClassComponent:
+            return updateClassComponent(current, workInProgress);
+        case HostComponent:
+            return updateHostComponent(current, workInProgress);
+    }
+}
+```
+
+##### 2.2 Diff 算法核心流程
+```typescript
+function reconcileChildren(current, workInProgress, nextChildren) {
+    if (current === null) {
+        // 挂载新组件
+        workInProgress.child = mountChildFibers(workInProgress, null, nextChildren);
+    } else {
+        // 更新现有组件
+        workInProgress.child = reconcileChildFibers(
+            workInProgress,
+            current.child,
+            nextChildren
+        );
+    }
+}
+
+function reconcileChildFibers(returnFiber, currentFirstChild, newChild) {
+    // 处理不同类型的子节点
+    
+    // 单个元素
+    if (typeof newChild === 'object' && newChild !== null) {
+        return placeSingleChild(
+            reconcileSingleElement(returnFiber, currentFirstChild, newChild)
+        );
+    }
+    
+    // 文本节点
+    if (typeof newChild === 'string' || typeof newChild === 'number') {
+        return placeSingleChild(
+            reconcileSingleTextNode(returnFiber, currentFirstChild, newChild)
+        );
+    }
+    
+    // 数组（列表）
+    if (isArray(newChild)) {
+        return reconcileChildrenArray(returnFiber, currentFirstChild, newChild);
+    }
+}
+```
+
+##### 2.3 列表 Diff 算法
+```typescript
+function reconcileChildrenArray(returnFiber, currentFirstChild, newChildren) {
+    // 第一轮遍历：处理更新的节点
+    let oldFiber = currentFirstChild;
+    let newIdx = 0;
+    
+    for (; oldFiber !== null && newIdx < newChildren.length; newIdx++) {
+        if (oldFiber.key !== newChildren[newIdx].key) {
+            break;  // key 不匹配，跳出第一轮
+        }
+        
+        // 更新节点
+        const newFiber = updateElement(oldFiber, newChildren[newIdx]);
+        lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+        
+        oldFiber = oldFiber.sibling;
+    }
+    
+    // 第二轮遍历：处理剩余情况
+    if (newIdx === newChildren.length) {
+        // 新列表遍历完，删除剩余旧节点
+        deleteRemainingChildren(returnFiber, oldFiber);
+        return resultingFirstChild;
+    }
+    
+    if (oldFiber === null) {
+        // 旧列表遍历完，插入剩余新节点
+        for (; newIdx < newChildren.length; newIdx++) {
+            const newFiber = createChild(returnFiber, newChildren[newIdx]);
+            lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+        }
+        return resultingFirstChild;
+    }
+    
+    // 第三轮遍历：处理节点移动
+    // 构建 key -> oldFiber 的映射
+    const existingChildren = mapRemainingChildren(returnFiber, oldFiber);
+    
+    for (; newIdx < newChildren.length; newIdx++) {
+        const newFiber = updateFromMap(existingChildren, newChildren[newIdx]);
+        if (newFiber !== null) {
+            existingChildren.delete(newFiber.key);
+            lastPlacedIndex = placeChild(newFiber, lastPlacedIndex, newIdx);
+        }
+    }
+    
+    // 删除未使用的节点
+    existingChildren.forEach(child => deleteChild(returnFiber, child));
+}
+```
+
+#### 3. Commit 阶段（不可中断）
+
+##### 3.1 Before Mutation 阶段
+- 调用 `getSnapshotBeforeUpdate` 生命周期
+- 保存当前 DOM 状态供后续使用
+
+##### 3.2 Mutation 阶段
+```typescript
+function commitMutationEffects(fiber: Fiber) {
+    switch (fiber.tag) {
+        case HostComponent: {
+            const instance = fiber.stateNode;
+            
+            if (fiber.flags & Placement) {
+                // 插入新节点
+                appendChildToContainer(instance);
+            }
+            
+            if (fiber.flags & Update) {
+                // 更新属性
+                const updatePayload = fiber.updateQueue;
+                commitUpdate(instance, updatePayload);
+            }
+            
+            if (fiber.flags & Deletion) {
+                // 删除节点
+                removeChildFromContainer(instance);
+            }
+            
+            break;
+        }
+    }
+}
+```
+
+##### 3.3 Layout 阶段
+- 调用 `componentDidMount`、`componentDidUpdate` 等生命周期
+- 在 Ink 中，触发布局计算和渲染
+
+### 性能优化策略
+
+#### 1. 时间切片（Time Slicing）
+React 通过 Fiber 架构实现了可中断的渲染：
+```typescript
+function workLoop(deadline) {
+    while (nextUnitOfWork && deadline.timeRemaining() > 0) {
+        nextUnitOfWork = performUnitOfWork(nextUnitOfWork);
+    }
+    
+    if (nextUnitOfWork) {
+        // 还有工作未完成，请求下一次调度
+        requestIdleCallback(workLoop);
+    } else {
+        // 渲染阶段完成，进入提交阶段
+        commitRoot();
+    }
+}
+```
+
+#### 2. 批量更新
+多个状态更新会被合并成一次渲染：
+```typescript
+this.setState({a: 1});
+this.setState({b: 2});
+this.setState({c: 3});
+// 只会触发一次重新渲染
+```
+
+#### 3. Bailout 优化
+当组件的 props 和 state 都没有变化时，React 会跳过该组件的渲染：
+```typescript
+if (oldProps === newProps && oldState === newState) {
+    return bailoutOnAlreadyFinishedWork(current, workInProgress);
+}
+```
+
+### 总结
+
+React Reconciliation 算法通过巧妙的设计实现了高效的 UI 更新：
+
+1. **Diff 算法优化**：通过三个假设将 O(n³) 降至 O(n)
+2. **Fiber 架构**：实现可中断渲染和优先级调度
+3. **双缓冲机制**：平滑的 UI 更新体验
+4. **Key 的使用**：高效处理列表更新
+5. **批量更新**：减少不必要的渲染
+
+Ink 作为一个 React 自定义渲染器的实现，完美展示了这些概念如何应用到实际场景中，将 React 的声明式编程模型带入了终端环境。
+
 ## 内存管理
 
 ### 1. Yoga 节点清理
